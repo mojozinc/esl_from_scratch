@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"strconv"
@@ -13,18 +14,8 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-type CSVRecord struct {
-	//Represent a csvRecord
-	species string // 1 for setosa,
-	part    string // 1.0 for Sepal, 2.0 for petal
-	measure string // 1.0 for length, 2.0 for width
-	value   float64
-}
-
 type datarecord struct {
-	columns    *[]string
-	vector     []interface{}
-	column2idx *map[string]int
+	vector []interface{}
 }
 
 type dataframe struct {
@@ -47,18 +38,17 @@ func NewDataFrame(columns []string) dataframe {
 func (df *dataframe) addRow(vector []interface{}) {
 	var dr datarecord
 	dr.vector = vector
-	dr.columns = &df.columns
-	dr.column2idx = &df.column2idx
 	df.records = append(df.records, dr)
 }
 
 type featureEncoder struct {
 	encoder map[string]map[string]int
 	max     map[string]int
+	decoder map[string][]string
 }
 
-func (rec *datarecord) vectorize(encoder *featureEncoder) (Vector []float64) {
-	for i, column := range *rec.columns {
+func (rec *datarecord) vectorize(encoder *featureEncoder, columns []string) (Vector []float64) {
+	for i, column := range columns {
 		encoderTmp, ok := encoder.encoder[column]
 		if ok {
 			Vector = append(Vector, float64(encoderTmp[rec.vector[i].(string)]+1))
@@ -70,22 +60,25 @@ func (rec *datarecord) vectorize(encoder *featureEncoder) (Vector []float64) {
 }
 
 func buildEncoder(df dataframe) (encoder featureEncoder) {
-	buildencoder := func(values []string) (int, map[string]int) {
+	buildencoder := func(values []string) (int, map[string]int, []string) {
 		featureCount := 0
 		featureMap := make(map[string]int)
+		var decoder []string
 		for _, feature := range values {
 			_, ok := featureMap[feature]
 			if !ok {
+				decoder = append(decoder, feature)
 				featureMap[feature] = featureCount
 				featureCount++
 			}
 		}
-		return featureCount, featureMap
+		return featureCount, featureMap, decoder
 	}
 
 	fieldValues := make(map[string][]string)
 	encoder.encoder = make(map[string]map[string]int)
 	encoder.max = make(map[string]int)
+	encoder.decoder = make(map[string][]string)
 	for i, col := range df.columns {
 		for _, rec := range df.records {
 			val, ok := rec.vector[i].(string)
@@ -94,7 +87,7 @@ func buildEncoder(df dataframe) (encoder featureEncoder) {
 			}
 		}
 		if len(fieldValues[col]) > 0 {
-			encoder.max[col], encoder.encoder[col] = buildencoder(fieldValues[col])
+			encoder.max[col], encoder.encoder[col], encoder.decoder[col] = buildencoder(fieldValues[col])
 		}
 	}
 	return
@@ -117,7 +110,7 @@ func (df *dataframe) vectorize(encoder *featureEncoder, outputColumn string, mod
 	X := mat.NewDense(N, p, nil)
 	var yTmp []float64
 	for i, datapoint := range df.records {
-		vector := datapoint.vectorize(encoder)
+		vector := datapoint.vectorize(encoder, df.columns)
 		X.SetRow(i, append(vector[:outputColumnInt], vector[outputColumnInt+1:]...))
 		yTmp = append(yTmp, vector[outputColumnInt])
 	}
@@ -148,43 +141,106 @@ func (df *dataframe) vectorize(encoder *featureEncoder, outputColumn string, mod
 }
 
 func residualSquareSum(Y, yPredict *mat.Dense) float64 {
-	var deltaMat, rss mat.Dense
+	var deltaMat mat.Dense
 	deltaMat.Sub(yPredict, Y)
-	rss.Mul(deltaMat.T(), &deltaMat)
-	return rss.At(0, 0)
+	deltaMat.MulElem(&deltaMat, &deltaMat)
+	return mat.Sum(&deltaMat)
 }
 
-func predict(predictors *mat.Dense, weights *mat.Dense) mat.Dense {
-	var Ypredict mat.Dense
-	Ypredict.Mul(predictors, weights)
-	return Ypredict
+type linearModel struct {
+	modelType   string
+	outputLabel string
+	weights     *mat.Dense
 }
 
-func learn(X, Y *mat.Dense) mat.Dense {
-	// solve for beta = (x^t.x)^-1.x^t.y
-	var x0, x1, Beta mat.Dense
-	x0.Mul(X.T(), X)
-	x0.Inverse(&x0)
-	x1.Mul(&x0, X.T())
-	Beta.Mul(&x1, Y)
-	return Beta
-}
-func linearModel(df dataframe) {
+func (model *linearModel) learn(df dataframe) *mat.Dense {
+	fit := func(X, Y *mat.Dense) mat.Dense {
+		// solve for beta = (x^t.x)^-1.x^t.y
+		var x0, x1, Beta mat.Dense
+		x0.Mul(X.T(), X)
+		x0.Inverse(&x0)
+		x1.Mul(&x0, X.T())
+		Beta.Mul(&x1, Y)
+		return Beta
+	}
+
+	predict := func(predictors *mat.Dense, weights *mat.Dense) mat.Dense {
+		var yPredict mat.Dense
+		yPredict.Mul(predictors, weights)
+		activationFunction := func(vec []float64) []float64 {
+			max, i := vec[0], 0
+			for j, x := range vec {
+				if x > max {
+					max, i = x, j
+				}
+			}
+			var activatedVec []float64
+			for j := range vec {
+				if j == i {
+					activatedVec = append(activatedVec, 1.0)
+				} else {
+					activatedVec = append(activatedVec, 0.0)
+				}
+			}
+			return activatedVec
+		}
+		r, _ := yPredict.Dims()
+		if model.modelType == "classification" {
+			for i := 0; i < r; i++ {
+				yPredict.SetRow(i, activationFunction(yPredict.RawRowView(i)))
+			}
+		}
+		return yPredict
+	}
+
 	encoder := buildEncoder(df)
+	decodeClassLabel := func(onehot []float64) (label string) {
+		activeClass := -1
+		for i, x := range onehot {
+			if x == 1.0 {
+				activeClass = i
+				break
+			}
+		}
+		label = encoder.decoder[model.outputLabel][activeClass]
+		return label
+	}
 	testData, trainData := testTrainSplit(df, 0.3)
-	testX, testY := testData.vectorize(&encoder, "species", "classification")
-	trainX, trainY := trainData.vectorize(&encoder, "species", "classification")
-
-	weights := learn(trainX, trainY)
+	if model.modelType == "classification" && encoder.max[model.outputLabel] < 2 {
+		log.Printf("Nothing to fit, need atleast 2 classes in training data")
+		return nil
+	}
+	testX, testY := testData.vectorize(&encoder, model.outputLabel, model.modelType)
+	trainX, trainY := trainData.vectorize(&encoder, model.outputLabel, model.modelType)
+	// if model.modelType == "regression" {
+	// 	testY.Apply(func(i, j int, x float64) float64 { return 5 * x }, testY)
+	// 	trainY.Apply(func(i, j int, x float64) float64 { return 5 * x }, trainY)
+	// }
+	weights := fit(trainX, trainY)
+	model.weights = &weights
 	yPredict := predict(testX, &weights)
-	rss := residualSquareSum(testY, &yPredict)
-	var yaugmented mat.Dense
-	yaugmented.Augment(testY, &yPredict)
-	fmt.Println("residual square sum", rss)
-	fmt.Printf("Prediction\n%v\n", mat.Formatted(&yaugmented))
+	r, _ := testY.Dims()
+	failures := 0
+	for i := 0; i < r && failures < 1000; i++ {
+		switch model.modelType {
+		case "classification":
+			tx, px := decodeClassLabel(testY.RawRowView(i)), decodeClassLabel(yPredict.RawRowView(i))
+			if tx != px {
+				// fmt.Printf("predictors: %v, class: %s, predicted: %s\n", testX.RawRowView(i), tx, px)
+				failures++
+			}
+		case "regression":
+			tx, px := testY.RawRowView(i)[0], yPredict.RawRowView(i)[0]
+			if math.Pow(tx-px, 2) > math.Pow(0.1, 2) {
+				// fmt.Printf("predictors: %v, expected: %v, predicted: %v\n", testX.RawRowView(i), tx, px)
+				failures++
+			}
+		}
+	}
+	return model.weights
 }
 
-func loadData(datasetPath string) (df dataframe) {
+func loadDataFromCSV(datasetPath string, columns []columnDesc) (df dataframe) {
 	fp, err := os.Open(datasetPath)
 	if err != nil {
 		panic(err)
@@ -192,7 +248,14 @@ func loadData(datasetPath string) (df dataframe) {
 	defer fp.Close()
 	r := csv.NewReader(fp)
 	r.Read()
-	df = NewDataFrame([]string{"species", "part", "measure", "value"})
+	var columnNames []string
+	var columnIdxes []int
+	for _, pair := range columns {
+		columnNames = append(columnNames, pair.str)
+		columnIdxes = append(columnIdxes, pair.i)
+	}
+	df = NewDataFrame(columnNames)
+	var row []interface{}
 	for {
 		record, err := r.Read()
 		if err == io.EOF {
@@ -201,16 +264,49 @@ func loadData(datasetPath string) (df dataframe) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		val, err := strconv.ParseFloat(record[4], 64)
-		if err != nil {
-			log.Fatal(err)
+		row = make([]interface{}, len(columns))
+		for i, colDesc := range columns {
+			if colDesc.parser != nil {
+				row[i] = colDesc.parser(record[colDesc.i])
+			} else {
+				row[i] = record[colDesc.i]
+			}
 		}
-		df.addRow([]interface{}{record[1], record[2], record[3], val})
+		df.addRow(row)
 	}
 	return
 }
 
+type columnDesc struct {
+	str    string
+	i      int
+	parser func(value string) interface{}
+}
+
 func main() {
-	data := loadData("iris_tidy.csv")
-	linearModel(data)
+	headerDesc := []columnDesc{
+		{"species", 1, nil},
+		{"part", 2, nil},
+		{"measure", 3, nil},
+		{"value", 4, func(value string) interface{} {
+			val, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				log.Fatal(err)
+			}
+			return val
+		},
+		},
+	}
+	data := loadDataFromCSV("iris_tidy.csv", headerDesc)
+	var model linearModel
+	var weights *mat.Dense
+	model = linearModel{"regression", "species", nil}
+	weights = model.learn(data)
+	fmt.Printf("learned these weights for regression model\n%v\n\n", mat.Formatted(weights))
+
+	model = linearModel{"classification", "species", nil}
+	weights = model.learn(data)
+	if weights != nil {
+		fmt.Printf("learned these weights for classification model\n%v\n\n", mat.Formatted(weights))
+	}
 }
