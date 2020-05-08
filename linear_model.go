@@ -154,17 +154,35 @@ type linearModel struct {
 }
 
 func (model *linearModel) learn(df dataframe) *mat.Dense {
+	onevec := func(n int) []float64 {
+		var vec []float64
+		for i := 0; i < n; i++ {
+			vec = append(vec, 1.0)
+		}
+		return vec
+	}
 	fit := func(X, Y *mat.Dense) mat.Dense {
+		// minimise the expression (y - b.x)^2
 		// solve for beta = (x^t.x)^-1.x^t.y
-		var x0, x1, Beta mat.Dense
-		x0.Mul(X.T(), X)
-		x0.Inverse(&x0)
-		x1.Mul(&x0, X.T())
-		Beta.Mul(&x1, Y)
+		var x0, x1, x2, x3, Beta mat.Dense
+
+		// add a bias column
+		r, _ := X.Dims()
+		x0.Augment(X, mat.NewDense(r, 1, onevec(r)))
+		x1.Mul(x0.T(), &x0)
+		x2.Inverse(&x1)
+		x3.Mul(&x2, x0.T())
+		Beta.Mul(&x3, Y)
 		return Beta
 	}
 
-	predict := func(predictors *mat.Dense, weights *mat.Dense) mat.Dense {
+	predict := func(X *mat.Dense, weights *mat.Dense) mat.Dense {
+		var predictors *mat.Dense
+		var p mat.Dense
+		// add a bias column
+		r, _ := X.Dims()
+		p.Augment(X, mat.NewDense(r, 1, onevec(r)))
+		predictors = &p
 		var yPredict mat.Dense
 		yPredict.Mul(predictors, weights)
 		activationFunction := func(vec []float64) []float64 {
@@ -184,7 +202,7 @@ func (model *linearModel) learn(df dataframe) *mat.Dense {
 			}
 			return activatedVec
 		}
-		r, _ := yPredict.Dims()
+		r, _ = yPredict.Dims()
 		if model.modelType == "classification" {
 			for i := 0; i < r; i++ {
 				yPredict.SetRow(i, activationFunction(yPredict.RawRowView(i)))
